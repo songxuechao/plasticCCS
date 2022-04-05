@@ -1,0 +1,697 @@
+library(rio)
+library(tidyverse)
+library(e1071)
+library(caret)
+
+H <- read.csv("H descriptors.csv", header = T, sep = ",")
+variables <- colnames(trainH_higher_1.18)[-1]
+
+H_1130 <- H[,c("name","CCS", colnames(trainH_higher_1.18)[-1])]
+
+
+
+trainH <- H_1130[1:747,]
+testH <- H_1130[748:1076,]
+
+
+
+
+
+#delete feature with near zero var
+library(caret)
+newH <- H[,-nearZeroVar(H)]
+
+#scale x variables and log CCS
+scaled_H <- as_tibble(scale(H_1130[,3:1132]))
+scaled_H <- cbind(H_1130$name, log(H_1130$CCS), scaled_H)
+colnames(scaled_H)[1:2] <-c("name", "ccs")
+rownames(scaled_H) <- scaled_H$name
+scaled_H <- scaled_H[,-1]
+
+trainH <- scaled_H[1:747,]
+testH <- scaled_H[748:1076,]
+
+
+#divide into train and test dataset
+index <- sample(2, nrow(scaled_H), replace = T, prob = c(0.7, 0.3))
+trainH <- scaled_H[index==1,]
+testH <- scaled_H[index==2,]
+
+#build pls model,10-fold cross validation
+library(pls)
+pls_1 <- plsr(ccs ~ ., ncomp = 10, data = trainH, validation = "CV")
+summary(pls_1)
+plot(RMSEP(pls_1))
+
+library(plsVarSel)
+X <- trainH[,-1]
+vip <- VIP(pls_1, 8)
+barplot(vip)
+
+sr_2 <- SR(pls_1, 9, X)
+barplot(sr)
+sum(sr>1.1858)
+sr <- as.data.frame(sr)
+sr_data <- data.frame(feature = row.names(sr),
+                   importance = sr[, 1])
+sr <- sr_data[order(sr_data$importance, decreasing = T),,drop = F]
+
+sum(sr$importance>1.1858)
+
+#Select variables with sr > 1.1858
+trainH_higher_1.18 <- trainH[,sr$feature[1:1130]]
+trainH_higher_1.18 <- cbind(trainH$ccs, trainH_higher_1.18)
+colnames(trainH_higher_1.18)[1] <- "ccs"
+
+testH_higher_1.18 <- testH[,sr$feature[1:1130]]
+testH_higher_1.18 <- cbind(testH$ccs, testH_higher_1.18)
+colnames(testH_higher_1.18)[1] <- "ccs"
+
+
+library(e1071)
+library(caret)
+trainH_higher_1.18 <- trainH_higher_1.18[!rownames(trainH_higher_1.18) %in% c("295"),]
+testH_higher_1.18 <- testH_higher_1.18[!rownames(testH_higher_1.18) %in% c("778"),]
+
+
+tune.svm(ccs ~., data = trainH_higher_1.18, gamma = c(0.025, 0.05, 0.1, 0.25, 0.5)/1130, cost = 2^(-8:8))
+svm_1130 <- svm(ccs~.,data=trainH_higher_1.18, gamma = 0.00002212, cost = 256)
+
+
+svm_pred_1 <- predict(svm_1130, trainH[,-1])
+plot(exp(svm_pred_1), exp(trainH$ccs))
+rmsec <- RMSE(exp(svm_pred_1),exp(trainH$ccs))
+r2_train <-R2(exp(svm_pred_1),exp(trainH$ccs))
+
+svm_pred_2 <- predict(svm_1130, testH[,-1])
+plot(exp(svm_pred_2),exp(testH$ccs))
+rmsep <- RMSE(exp(svm_pred_2),exp(testH$ccs))
+r2_test <- R2(exp(svm_pred_2),exp(testH$ccs))
+
+
+
+final_train <- data.frame(pred = exp(svm_pred_1), empirical = exp(trainH$ccs))
+final_train <- final_train %>% mutate(error = (pred - empirical)/empirical*100)
+sum(final_train$error<5 & final_train$error>-5)
+sum(final_train$error<3 & final_train$error>-3)/length(final_train$error)
+median(abs(final_train$error))
+write.csv(final_train, file = "final_train.csv")
+
+final_test <- data.frame(pred = exp(svm_pred_2), empirical = exp(testH$ccs))
+final_test <- final_test %>% mutate(error = (pred - empirical)/empirical*100)
+sum(final_test$error<2 & final_test$error>-2)
+sum(final_test$error<5 & final_test$error>-5)/length(final_test$error)
+median(abs(final_test$error))
+
+write.csv(final_test, file = "pred_H_svm_1130.csv")
+
+
+
+#try XGBoost with 1130 descriptors
+library(xgboost)
+
+#optimize the xgboost parameters
+hyper_grid <- expand.grid(eta = c(0.01, 0.05, 0.1, 0.3),
+                          max_depth = c(3,5,7),
+                          min_child_weight = c(1,3,5),
+                          subsample = c(0.6, 0.7, 0.8, 0.9),
+                          colsample_bytree = c(0.6, 0.7, 0.8, 0.9),
+                          nrounds = 0, 
+                          RMSE = 0)
+head(hyper_grid)
+
+for(i in 1:nrow(hyper_grid)) {
+  params <- list(
+    eta = hyper_grid$eta[i],
+    max_depth = hyper_grid$max_depth[i],
+    min_child_weight = hyper_grid$min_child_weight[i],
+    subsample = hyper_grid$subsample[i],
+    colsample_bytree = hyper_grid$colsample_bytree[i]
+  )
+  
+  set.seed(1)
+  xgb_tune <- xgb.cv(
+    params = params,
+    data = as.matrix(trainH[,-1]),
+    label = trainH[,1],
+    nrounds =400,
+    nfold = 5,
+    objective = "reg:squarederror",
+    verbose = 0,
+    early_stopping_rounds = 10
+  )
+  hyper_grid$nrounds[i] <- which.min(xgb_tune$evaluation_log$test_rmse_mean)
+  hyper_grid$RMSE[i] <- min(xgb_tune$evaluation_log$test_rmse_mean)
+}
+
+
+
+#build xgboost model
+hyper_grid %>% arrange(RMSE) %>% head(10)
+
+set.seed(2)
+xgb_1 <- xgboost(data = as.matrix(trainH[,-1]), label = trainH[,1],
+                 eta = 0.05, max_depth = 5, 
+                 min_child_weight = 1, 
+                 subsample = 0.7, colsample_bytree = 0.8,
+                 nrounds = 323,
+                 objective = "reg:squarederror")
+
+pred_1 <- predict(xgb_1, as.matrix(testH[,-1]))
+pred_1 <- as.data.frame(pred_1)
+pred_1 <- cbind(pred_1,testH[,1])
+colnames(pred_1)[2] <- "measured_ccs"
+pred_xgb_test <- pred_1 %>% mutate(predicted = exp(pred_1), measured = exp(measured_ccs), error = (predicted-measured)/measured*100)
+pred_xgb_test <- pred_xgb_test %>% select(-pred_1,-measured_ccs)
+
+
+plot(pred_xgb_test$predicted, pred_xgb_test$measured)
+rmsep <- RMSE(pred_xgb_test$predicted, pred_xgb_test$measured)
+r2_test <-R2(pred_xgb_test$predicted, pred_xgb_test$measured)
+sum(pred_xgb_test$error<3 & pred_xgb_test$error>-3)/length(pred_xgb_test$error)
+median(abs(pred_xgb_test$error))
+
+pred_xgb_test <- pred_xgb_test %>% mutate(data="alvadesc", algorithm = "XGBoost")
+write.csv(pred_xgb_test, file = "pred_H_xgb_1130.csv")
+
+
+# important of variables
+imp_var <- xgb.importance(feature_names = colnames(trainH)[-1], model = xgb_1)
+xgb.plot.importance(importance_matrix = imp_var, top_n = 20)
+sum(imp_var$Gain[1:334])
+write.csv(imp_var, file = "imp_var.csv")
+
+
+#select 334 (99%) important variables in train and test set
+trainH_334 <- trainH[,c("ccs",imp_var$Feature[1:334])]
+testH_334 <- testH[, c("ccs", imp_var$Feature[1:334])]
+
+#build SVM model with 334 descriptors
+tune.svm(ccs ~., data = trainH_334, gamma = c(0.025, 0.05, 0.1, 0.25, 0.5)/334, cost = 2^(-8:8))
+svm_334 <- svm(ccs~.,data=trainH_334, gamma = 0.0002994012, cost = 32)
+
+
+svm_pred_1 <- predict(svm_334, trainH_334[,-1])
+plot(exp(svm_pred_1), exp(trainH_334$ccs))
+rmsec <- RMSE(exp(svm_pred_1),exp(trainH_334$ccs))
+r2_train <-R2(exp(svm_pred_1),exp(trainH_334$ccs))
+
+svm_pred_2 <- predict(svm_334, testH_334[,-1])
+plot(exp(svm_pred_2),exp(testH_334$ccs))
+rmsep <- RMSE(exp(svm_pred_2),exp(testH_334$ccs))
+r2_test <- R2(exp(svm_pred_2),exp(testH_334$ccs))
+
+
+
+final_train <- data.frame(pred = exp(svm_pred_1), empirical = exp(trainH$ccs))
+final_train <- final_train %>% mutate(error = (pred - empirical)/empirical*100)
+sum(final_train$error<2 & final_train$error>-2)/length(final_train$error)
+sum(final_train$error<5 & final_train$error>-5)/length(final_train$error)
+median(abs(final_train$error))
+
+
+final_test <- data.frame(pred = exp(svm_pred_2), empirical = exp(testH$ccs))
+final_test <- final_test %>% mutate(error = (pred - empirical)/empirical*100)
+sum(final_test$error<2 & final_test$error>-2)/length(final_test$error)
+sum(final_test$error<5 & final_test$error>-5)/length(final_test$error)
+median(abs(final_test$error))
+
+write.csv(final_test, file = "pred_H_svm_334.csv")
+
+
+
+# remove descriptors with collinearity
+library(usdm)
+
+data <- trainH_334[,2:335]
+v2 <- vifstep(data, th = 10)
+
+v2@results[["Variables"]]
+v2@results
+
+
+
+trainH_48 <- trainH_334[,c("ccs", v2@results[["Variables"]])]
+testH_48 <- testH_334[,c("ccs", v2@results[["Variables"]])]
+
+library(tidyverse)
+library(e1071)
+library(caret)
+tune.svm(ccs ~., data = trainH_48, gamma = c(0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5)/48, cost = 2^(-8:10))
+svm_48 <- svm(ccs~.,data=trainH_48, gamma = 0.002083333, cost = 64)
+
+
+svm_pred_1 <- predict(svm_48, trainH_48[,-1])
+plot(exp(svm_pred_1), exp(trainH_48$ccs))
+rmsec <- RMSE(exp(svm_pred_1),exp(trainH_48$ccs))
+r2_train <-R2(exp(svm_pred_1),exp(trainH_48$ccs))
+
+svm_pred_2 <- predict(svm_48, testH_48[,-1])
+plot(exp(svm_pred_2),exp(testH_48$ccs))
+rmsep <- RMSE(exp(svm_pred_2),exp(testH_48$ccs))
+r2_test <- R2(exp(svm_pred_2),exp(testH_48$ccs))
+
+
+
+final_train <- data.frame(pred = exp(svm_pred_1), empirical = exp(trainH$ccs))
+final_train <- final_train %>% mutate(error = (pred - empirical)/empirical*100)
+sum(final_train$error<2 & final_train$error>-2)/length(final_train$error)
+sum(final_train$error<5 & final_train$error>-5)/length(final_train$error)
+median(abs(final_train$error))
+
+final_test <- data.frame(pred = exp(svm_pred_2), empirical = exp(testH$ccs))
+final_test <- final_test %>% mutate(error = (pred - empirical)/empirical*100)
+sum(final_test$error<2 & final_test$error>-2)/length(final_test$error)
+sum(final_test$error<5 & final_test$error>-5)/length(final_test$error)
+median(abs(final_test$error))
+
+write.csv(final_test, file = "pred_H_svm_48.csv")
+
+
+#optimize xgboost model with 222 descriptors
+library(xgboost)
+for(i in 1:nrow(hyper_grid)) {
+  params <- list(
+    eta = hyper_grid$eta[i],
+    max_depth = hyper_grid$max_depth[i],
+    min_child_weight = hyper_grid$min_child_weight[i],
+    subsample = hyper_grid$subsample[i],
+    colsample_bytree = hyper_grid$colsample_bytree[i]
+  )
+  
+  set.seed(22)
+  xgb_tune <- xgb.cv(
+    params = params,
+    data = as.matrix(trainH_48[,-1]),
+    label = trainH_48[,1],
+    nrounds = 400,
+    nfold = 5,
+    objective = "reg:squarederror",
+    verbose = 0,
+    early_stopping_rounds = 10
+  )
+  hyper_grid$nrounds[i] <- which.min(xgb_tune$evaluation_log$test_rmse_mean)
+  hyper_grid$RMSE[i] <- min(xgb_tune$evaluation_log$test_rmse_mean)
+}
+
+hyper_grid %>% arrange(RMSE) %>% head(10)
+
+
+#build xgboost with 222 descriptors
+set.seed(48)
+xgb_48 <- xgboost(data = as.matrix(trainH_48[,-1]), label = trainH_48[,1],
+                   eta = 0.05, max_depth = 5, 
+                   min_child_weight = 3, 
+                   subsample = 0.6, colsample_bytree = 0.9,
+                   nrounds = 298,
+                   objective = "reg:squarederror")
+
+pred_1 <- predict(xgb_48, as.matrix(testH_48[,-1]))
+pred_1 <- as.data.frame(pred_1)
+pred_1 <- cbind(pred_1, testH_48[,1])
+colnames(pred_1)[2] <- "measured_ccs"
+pred_xgb_test <- pred_1 %>% mutate(predicted = exp(pred_1), measured = exp(measured_ccs), error = (predicted-measured)/measured*100)
+pred_xgb_test <- pred_xgb_test %>% select(-pred_1,-measured_ccs)
+
+
+plot(pred_xgb_test$predicted, pred_xgb_test$measured)
+rmsep <- RMSE(pred_xgb_test$predicted, pred_xgb_test$measured)
+r2_test <-R2(pred_xgb_test$predicted, pred_xgb_test$measured)
+sum(pred_xgb_test$error<2 & pred_xgb_test$error>-2)/length(pred_xgb_test$error)
+sum(pred_xgb_test$error<3 & pred_xgb_test$error>-3)/length(pred_xgb_test$error)
+median(abs(pred_xgb_test$error))
+
+pred_xgb_test <- pred_xgb_test %>% mutate(data="alva_48", algorithm = "XGBoost")
+write.csv(pred_xgb_test, file = "pred_H_xgb_48.csv")
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+#optimize xgboost model with 334 descriptors
+for(i in 1:nrow(hyper_grid)) {
+  params <- list(
+    eta = hyper_grid$eta[i],
+    max_depth = hyper_grid$max_depth[i],
+    min_child_weight = hyper_grid$min_child_weight[i],
+    subsample = hyper_grid$subsample[i],
+    colsample_bytree = hyper_grid$colsample_bytree[i]
+  )
+  
+  set.seed(3)
+  xgb_tune <- xgb.cv(
+    params = params,
+    data = as.matrix(trainH_334[,-1]),
+    label = trainH_334[,1],
+    nrounds =400,
+    nfold = 5,
+    objective = "reg:squarederror",
+    verbose = 0,
+    early_stopping_rounds = 10
+  )
+  hyper_grid$nrounds[i] <- which.min(xgb_tune$evaluation_log$test_rmse_mean)
+  hyper_grid$RMSE[i] <- min(xgb_tune$evaluation_log$test_rmse_mean)
+}
+
+hyper_grid %>% arrange(RMSE) %>% head(10)
+
+
+#build xgboost with 334 descriptors
+set.seed(334)
+xgb_334 <- xgboost(data = as.matrix(trainH_334[,-1]), label = trainH_334[,1],
+                 eta = 0.05, max_depth = 5, 
+                 min_child_weight = 1, 
+                 subsample = 0.9, colsample_bytree = 0.6,
+                 nrounds = 328,
+                 objective = "reg:squarederror")
+
+pred_1 <- predict(xgb_334, as.matrix(testH_334[,-1]))
+pred_1 <- as.data.frame(pred_1)
+pred_1 <- cbind(pred_1,testH_334[,1])
+colnames(pred_1)[2] <- "measured_ccs"
+pred_xgb_test <- pred_1 %>% mutate(predicted = exp(pred_1), measured = exp(measured_ccs), error = (predicted-measured)/measured*100)
+pred_xgb_test <- pred_xgb_test %>% select(-pred_1,-measured_ccs)
+
+
+plot(pred_xgb_test$predicted, pred_xgb_test$measured)
+rmsep <- RMSE(pred_xgb_test$predicted, pred_xgb_test$measured)
+r2_test <-R2(pred_xgb_test$predicted, pred_xgb_test$measured)
+sum(pred_xgb_test$error<5 & pred_xgb_test$error>-5)/length(pred_xgb_test$error)
+median(abs(pred_xgb_test$error))
+
+pred_xgb_test <- pred_xgb_test %>% mutate(data="alva_334", algorithm = "XGBoost")
+
+write.csv(pred_xgb_test, file = "pred_H_xgb_334.csv")
+
+
+
+
+
+
+
+#select 222 (98%) important variables in train and test set
+trainH_222 <- trainH[,c("ccs",imp_var$Feature[1:222])]
+testH_222 <- testH[, c("ccs", imp_var$Feature[1:222])]
+
+#build SVM model with 222 descriptors
+tune.svm(ccs ~., data = trainH_222, gamma = c(0.025, 0.05, 0.1, 0.25, 0.5)/222, cost = 2^(-8:8))
+svm_222 <- svm(ccs~.,data=trainH_222, gamma = 0.0004504505, cost = 16)
+
+
+svm_pred_1 <- predict(svm_222, trainH_222[,-1])
+plot(exp(svm_pred_1), exp(trainH_222$ccs))
+rmsec <- RMSE(exp(svm_pred_1),exp(trainH_222$ccs))
+r2_train <-R2(exp(svm_pred_1),exp(trainH_222$ccs))
+
+svm_pred_2 <- predict(svm_222, testH_222[,-1])
+plot(exp(svm_pred_2),exp(testH_222$ccs))
+rmsep <- RMSE(exp(svm_pred_2),exp(testH_222$ccs))
+r2_test <- R2(exp(svm_pred_2),exp(testH_222$ccs))
+
+
+
+final_train <- data.frame(pred = exp(svm_pred_1), empirical = exp(trainH$ccs))
+final_train <- final_train %>% mutate(error = (pred - empirical)/empirical*100)
+sum(final_train$error<5 & final_train$error>-5)
+sum(final_train$error<5 & final_train$error>-5)/length(final_train$error)
+median(abs(final_train$error))
+
+final_test <- data.frame(pred = exp(svm_pred_2), empirical = exp(testH$ccs))
+final_test <- final_test %>% mutate(error = (pred - empirical)/empirical*100)
+sum(final_test$error<2 & final_test$error>-2)
+sum(final_test$error<5 & final_test$error>-5)/length(final_test$error)
+median(abs(final_test$error))
+
+write.csv(final_test, file = "pred_H_svm_222.csv")
+
+
+#optimize xgboost model with 222 descriptors
+for(i in 1:nrow(hyper_grid)) {
+  params <- list(
+    eta = hyper_grid$eta[i],
+    max_depth = hyper_grid$max_depth[i],
+    min_child_weight = hyper_grid$min_child_weight[i],
+    subsample = hyper_grid$subsample[i],
+    colsample_bytree = hyper_grid$colsample_bytree[i]
+  )
+  
+  set.seed(4)
+  xgb_tune <- xgb.cv(
+    params = params,
+    data = as.matrix(trainH_222[,-1]),
+    label = trainH_222[,1],
+    nrounds =400,
+    nfold = 5,
+    objective = "reg:squarederror",
+    verbose = 0,
+    early_stopping_rounds = 10
+  )
+  hyper_grid$nrounds[i] <- which.min(xgb_tune$evaluation_log$test_rmse_mean)
+  hyper_grid$RMSE[i] <- min(xgb_tune$evaluation_log$test_rmse_mean)
+}
+
+hyper_grid %>% arrange(RMSE) %>% head(10)
+
+
+#build xgboost with 222 descriptors
+set.seed(222)
+xgb_222 <- xgboost(data = as.matrix(trainH_222[,-1]), label = trainH_222[,1],
+                   eta = 0.05, max_depth = 5, 
+                   min_child_weight = 1, 
+                   subsample = 0.6, colsample_bytree = 0.9,
+                   nrounds = 234,
+                   objective = "reg:squarederror")
+
+pred_1 <- predict(xgb_222, as.matrix(testH_222[,-1]))
+pred_1 <- as.data.frame(pred_1)
+pred_1 <- cbind(pred_1, testH_222[,1])
+colnames(pred_1)[2] <- "measured_ccs"
+pred_xgb_test <- pred_1 %>% mutate(predicted = exp(pred_1), measured = exp(measured_ccs), error = (predicted-measured)/measured*100)
+pred_xgb_test <- pred_xgb_test %>% select(-pred_1,-measured_ccs)
+
+
+plot(pred_xgb_test$predicted, pred_xgb_test$measured)
+rmsep <- RMSE(pred_xgb_test$predicted, pred_xgb_test$measured)
+r2_test <-R2(pred_xgb_test$predicted, pred_xgb_test$measured)
+sum(pred_xgb_test$error<3 & pred_xgb_test$error>-3)/length(pred_xgb_test$error)
+median(abs(pred_xgb_test$error))
+
+pred_xgb_test <- pred_xgb_test %>% mutate(data="alva_222", algorithm = "XGBoost")
+write.csv(pred_xgb_test, file = "pred_H_xgb_222.csv")
+
+
+
+
+
+
+#build SVM model with 96 descriptors (95%)
+
+#select 96 (95%) important variables in train and test set
+trainH_96 <- trainH[,c("ccs",imp_var$Feature[1:96])]
+testH_96 <- testH[, c("ccs", imp_var$Feature[1:96])]
+
+#build SVM model with 222 descriptors
+tune.svm(ccs ~., data = trainH_96, gamma = c(0.025, 0.05, 0.1, 0.25, 0.5)/96, cost = 2^(-8:8))
+svm_96 <- svm(ccs~.,data=trainH_96, gamma = 0.001041667, cost = 32)
+
+
+svm_pred_1 <- predict(svm_96, trainH_96[,-1])
+plot(exp(svm_pred_1), exp(trainH_96$ccs))
+rmsec <- RMSE(exp(svm_pred_1),exp(trainH_96$ccs))
+r2_train <-R2(exp(svm_pred_1),exp(trainH_96$ccs))
+
+svm_pred_2 <- predict(svm_96, testH_96[,-1])
+plot(exp(svm_pred_2),exp(testH_96$ccs))
+rmsep <- RMSE(exp(svm_pred_2),exp(testH_96$ccs))
+r2_test <- R2(exp(svm_pred_2),exp(testH_96$ccs))
+
+
+
+final_train <- data.frame(pred = exp(svm_pred_1), empirical = exp(trainH$ccs))
+final_train <- final_train %>% mutate(error = (pred - empirical)/empirical*100)
+sum(final_train$error<5 & final_train$error>-5)
+sum(final_train$error<3 & final_train$error>-3)/length(final_train$error)
+median(abs(final_train$error))
+
+final_test <- data.frame(pred = exp(svm_pred_2), empirical = exp(testH$ccs))
+final_test <- final_test %>% mutate(error = (pred - empirical)/empirical*100)
+sum(final_test$error<2 & final_test$error>-2)
+sum(final_test$error<3 & final_test$error>-3)/length(final_test$error)
+median(abs(final_test$error))
+
+write.csv(final_test, file = "pred_H_svm_96.csv")
+
+
+#optimize xgboost model with 96 descriptors
+for(i in 1:nrow(hyper_grid)) {
+  params <- list(
+    eta = hyper_grid$eta[i],
+    max_depth = hyper_grid$max_depth[i],
+    min_child_weight = hyper_grid$min_child_weight[i],
+    subsample = hyper_grid$subsample[i],
+    colsample_bytree = hyper_grid$colsample_bytree[i]
+  )
+  
+  set.seed(5)
+  xgb_tune <- xgb.cv(
+    params = params,
+    data = as.matrix(trainH_96[,-1]),
+    label = trainH_96[,1],
+    nrounds =400,
+    nfold = 5,
+    objective = "reg:squarederror",
+    verbose = 0,
+    early_stopping_rounds = 10
+  )
+  hyper_grid$nrounds[i] <- which.min(xgb_tune$evaluation_log$test_rmse_mean)
+  hyper_grid$RMSE[i] <- min(xgb_tune$evaluation_log$test_rmse_mean)
+}
+
+hyper_grid %>% arrange(RMSE) %>% head(10)
+
+
+#build xgboost with 96 descriptors
+set.seed(96)
+xgb_96 <- xgboost(data = as.matrix(trainH_96[,-1]), label = trainH_96[,1],
+                   eta = 0.05, max_depth = 7, 
+                   min_child_weight = 3, 
+                   subsample = 0.7, colsample_bytree = 0.7,
+                   nrounds = 223,
+                   objective = "reg:squarederror")
+
+pred_1 <- predict(xgb_96, as.matrix(testH_96[,-1]))
+pred_1 <- as.data.frame(pred_1)
+pred_1 <- cbind(pred_1, testH_96[,1])
+colnames(pred_1)[2] <- "measured_ccs"
+pred_xgb_test <- pred_1 %>% mutate(predicted = exp(pred_1), measured = exp(measured_ccs), error = (predicted-measured)/measured*100)
+pred_xgb_test <- pred_xgb_test %>% select(-pred_1,-measured_ccs)
+
+
+plot(pred_xgb_test$predicted, pred_xgb_test$measured)
+rmsep <- RMSE(pred_xgb_test$predicted, pred_xgb_test$measured)
+r2_test <-R2(pred_xgb_test$predicted, pred_xgb_test$measured)
+sum(pred_xgb_test$error<5 & pred_xgb_test$error>-5)/length(pred_xgb_test$error)
+median(abs(pred_xgb_test$error))
+
+pred_xgb_test <- pred_xgb_test %>% mutate(data="alva_96", algorithm = "XGBoost")
+write.csv(pred_xgb_test, file = "pred_H_xgb_96.csv")
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+final_testhigher5 <- final_test[final_test$error > 5 | final_test$error < -5,]
+write.csv(final_testhigher5, file = "final_test_higher5.csv")
+
+
+
+
+
+
+
+
+
+
+
+#compare with real ccs
+
+trainH_realccs <- cbind(exp(trainH_higher_1.18$ccs), trainH_higher_1.18[,-1])
+colnames(trainH_realccs)[1] <- "ccs"
+
+testH_realccs <- cbind(exp(testH_higher_1.18$ccs), testH_higher_1.18[,-1])
+colnames(testH_realccs)[1] <- "ccs"
+
+
+tune.svm(ccs ~., data = trainH_realccs, gamma = c(0.025, 0.05, 0.1, 0.25, 0.5)/1130, cost = 2^(-8:8))
+
+svm_1130_realccs <- svm(ccs~.,data=trainH_realccs, gamma = 0.00008849, cost = 64)
+
+
+svm_pred_3 <- predict(svm_1130_realccs, trainH_realccs[,-1])
+plot(svm_pred_3, trainH_realccs$ccs)
+rmsec <- RMSE(svm_pred_3,trainH_realccs$ccs)
+
+svm_pred_4 <- predict(svm_1130_realccs, testH_realccs[,-1])
+plot(svm_pred_4,testH_realccs$ccs)
+rmsep <- RMSE(svm_pred_4,testH_realccs$ccs)
+
+
+library(tidyverse)
+final_train_realccs <- data.frame(pred = svm_pred_3, empirical = trainH_realccs$ccs)
+final_train_realccs <- final_train_realccs %>% mutate(error = (pred - empirical)/empirical*100)
+sum(final_train_realccs$error<5 & final_train_realccs$error>-5)
+sum(final_train_realccs$error<2 & final_train_realccs$error>-2)/length(final_train_realccs$error)
+write.csv(final_train_realccs, file = "final_train_realccs.csv")
+
+final_test_realccs <- data.frame(pred = svm_pred_4, empirical = testH_realccs$ccs)
+final_test_realccs <- final_test_realccs %>% mutate(error = (pred - empirical)/empirical*100)
+sum(final_test_realccs$error<5 & final_test_realccs$error>-5)
+sum(final_test_realccs$error<2 & final_test_realccs$error>-2)/length(final_test_realccs$error)
+write.csv(final_test_realccs, file = "final_test_realccs.csv")
+
+
+#compare with 3303 variables
+
+trainH<- trainH[!rownames(trainH) %in% c("295"),]
+testH <- testH[!rownames(testH) %in% c("778"),]
+
+library(e1071)
+tune.svm(ccs ~., data = trainH, gamma = c(0.025, 0.05, 0.1, 0.25, 0.5)/3303, cost = 2^(-8:8))
+
+
+svm_3303 <- svm(ccs~.,data=trainH, gamma = 0.000007568877, cost = 16)
+
+
+svm_pred_5 <- predict(svm_3303, trainH[,-1])
+plot(exp(svm_pred_5), exp(trainH$ccs))
+rmsec <- RMSE(exp(svm_pred_5),exp(trainH$ccs))
+r2_train <-R2(exp(svm_pred_5),exp(trainH$ccs))
+
+svm_pred_6 <- predict(svm_3303, testH[,-1])
+plot(exp(svm_pred_6), exp(testH$ccs))
+rmsep <- RMSE(exp(svm_pred_6),exp(testH$ccs))
+r2 <-R2(exp(svm_pred_6),exp(testH$ccs))
+
+
+
+final_train_3303 <- data.frame(pred = exp(svm_pred_5), empirical = exp(trainH$ccs))
+final_train_3303 <- final_train_3303 %>% mutate(error = (pred - empirical)/empirical*100)
+sum(final_train_3303$error<5 & final_train_3303$error>-5)
+sum(final_train_3303$error<2 & final_train_3303$error>-2)/length(final_train_3303$error)
+
+final_test_3303 <- data.frame(pred = exp(svm_pred_6), empirical = exp(testH$ccs))
+final_test_3303 <- final_test_3303 %>% mutate(error = (pred - empirical)/empirical*100)
+sum(final_test_3303$error<2 & final_test_3303$error>-2)
+sum(final_test_3303$error<2 & final_test_3303$error>-2)/length(final_test_3303$error)
+
+
